@@ -1,0 +1,411 @@
+import os
+import numpy as np
+import cv2
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader, random_split
+from torch.optim import Adam
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from skimage import measure
+from sklearn.metrics import precision_recall_fscore_support, jaccard_score
+from torchvision import transforms
+
+# Check for MPS availability
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+# ================ Dataset Implementation ================
+class SunspotDataset(Dataset):
+    def __init__(self, img_dir, img_size=(224, 224)):  # Adjusted image size
+        self.img_dir = img_dir
+        self.img_size = img_size
+        self.img_files = [f for f in os.listdir(img_dir)
+                          if os.path.isfile(os.path.join(img_dir, f)) and
+                          f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+
+    def __len__(self):
+        return len(self.img_files)
+
+    def _correct_limb_darkening(self, image):
+        h, w = image.shape[:2]
+        center = (w // 2, h // 2)
+        radius = min(w, h) // 2
+        Y, X = np.ogrid[:h, :w]
+        dist_from_center = np.sqrt((X - center[0])**2 + (Y - center[1])**2)
+        normalized_dist = np.clip(dist_from_center / radius, 0, 1)
+        a, b, c = 0.3, 0.5, 0.2
+        correction = 1 / (1 - a * (1 - np.sqrt(1 - normalized_dist**2)) - 
+                             b * (1 - np.sqrt(1 - normalized_dist**2))**2 - 
+                             c * (1 - np.sqrt(1 - normalized_dist**2))**3)
+        corrected_img = image.copy().astype(np.float32)
+        for i in range(3):
+            channel = corrected_img[:, :, i]
+            solar_disk_mask = dist_from_center <= radius
+            channel[solar_disk_mask] = channel[solar_disk_mask] * correction[solar_disk_mask]
+        corrected_img = np.clip(corrected_img, 0, 255).astype(np.uint8)
+        return corrected_img
+
+    def _enhance_contrast(self, image):
+        lab = cv2.cvtColor(image, cv2.COLOR_RGB2LAB)
+        l, a, b = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        cl = clahe.apply(l)
+        enhanced_lab = cv2.merge((cl, a, b))
+        enhanced_rgb = cv2.cvtColor(enhanced_lab, cv2.COLOR_LAB2RGB)
+        return enhanced_rgb
+
+    def _reduce_noise(self, image):
+        return cv2.GaussianBlur(image, (3, 3), 0)  # Smaller kernel
+
+    def preprocess_image(self, image_path):
+        """Apply preprocessing to a solar image"""
+        image = cv2.imread(image_path)
+        if image is None:
+            raise ValueError(f"Could not read image at {image_path}")
+
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        image = cv2.resize(image, self.img_size)
+        image = self._correct_limb_darkening(image)
+        image = self._enhance_contrast(image)
+        image = self._reduce_noise(image)
+        return image
+
+    def generate_mask(self, image):
+        if len(image.shape) == 3:
+            gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+        else:
+            gray = image
+        gray_float = (255 - gray.astype(np.float32)) / 255.0
+        normalized = cv2.normalize(gray_float, None, 0, 1, cv2.NORM_MINMAX)
+        _, binary = cv2.threshold((normalized * 255).astype(np.uint8), 0, 255,
+                                    cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        kernel = np.ones((3, 3), np.uint8)
+        opening = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
+        labeled_array, num_features = measure.label(opening, return_num=True)
+        component_sizes = np.bincount(labeled_array.ravel())
+        small_size_threshold = 20  # Reduced threshold for smaller images
+        too_small = component_sizes < small_size_threshold
+        too_small[0] = False
+        labeled_array[np.isin(labeled_array, np.where(too_small)[0])] = 0
+        final_mask = labeled_array > 0
+        return final_mask.astype(np.uint8) * 255
+
+    def __getitem__(self, idx):
+        img_path = os.path.join(self.img_dir, self.img_files[idx])
+        proc_img = self.preprocess_image(img_path)
+        mask = self.generate_mask(proc_img)
+
+        # Convert to PyTorch tensors and normalize
+        image_tensor = torch.from_numpy(proc_img).permute(2, 0, 1).float() / 255.0
+        mask_tensor = torch.from_numpy(mask).unsqueeze(0).float() / 255.0
+
+        return image_tensor, mask_tensor
+
+# ================ Minimal U-Net Model Implementation ================
+class DoubleConv(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, 3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x):
+        return self.conv(x)
+
+class UNet(nn.Module):
+    def __init__(self, in_channels=3, out_channels=1, features=[64, 128]): # increased features
+        super().__init__()
+        self.downs = nn.ModuleList()
+        self.ups = nn.ModuleList()
+        self.pool = nn.MaxPool2d(2, 2)
+
+        # Downward path
+        for feature in features:
+            self.downs.append(DoubleConv(in_channels, feature))
+            in_channels = feature
+
+        # Upward path
+        for feature in reversed(features):
+            self.ups.append(
+                nn.ConvTranspose2d(feature * 2, feature, kernel_size=2, stride=2)
+            )
+            self.ups.append(DoubleConv(feature * 2, feature))
+
+        self.bottleneck = DoubleConv(features[-1], features[-1] * 2)
+        self.final_conv = nn.Conv2d(features[0], out_channels, kernel_size=1)
+
+    def forward(self, x):
+        skip_connections = []
+
+        for down in self.downs:
+            x = down(x)
+            skip_connections.append(x)
+            x = self.pool(x)
+
+        x = self.bottleneck(x)
+        skip_connections = skip_connections[::-1]
+
+        for idx in range(0, len(self.ups), 2):
+            x = self.ups[idx](x)
+            skip_connection = skip_connections[idx // 2]
+
+            if x.shape != skip_connection.shape:
+                x = F.interpolate(x, size=skip_connection.shape[2:], mode='bilinear', align_corners=True)
+
+            concat_skip = torch.cat((skip_connection, x), dim=1)
+            x = self.ups[idx + 1](concat_skip)
+
+        return self.final_conv(x)
+
+# ================ Training Function ================
+def train_model(model, train_loader, val_loader, epochs=20, lr=1e-4, accumulation_steps=4):
+    model.to(device)
+    optimizer = Adam(model.parameters(), lr=lr, weight_decay=1e-5) #L2 Regularization
+    scheduler = ReduceLROnPlateau(optimizer, 'min', patience=3, factor=0.1)
+    criterion = nn.BCEWithLogitsLoss()
+
+    best_loss = float('inf')
+    train_losses, val_losses = [], []
+
+    save_dir = os.path.expanduser("~/saved_models")
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
+
+    model_path = os.path.join(save_dir, "sunspot_unet_minimal.pth")
+
+    for epoch in range(epochs):
+        model.train()
+        epoch_train_loss = 0.0
+        optimizer.zero_grad()
+
+        for i, (images, masks) in enumerate(train_loader):
+            images = images.to(device)
+            masks = masks.to(device)
+
+            outputs = model(images)
+            loss = criterion(outputs, masks) / accumulation_steps
+            loss.backward()
+
+            if (i + 1) % accumulation_steps == 0 or (i + 1) == len(train_loader):
+                optimizer.step()
+                optimizer.zero_grad()
+
+            epoch_train_loss += loss.item() * accumulation_steps * images.size(0)
+
+            del images, masks, outputs
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        model.eval()
+        epoch_val_loss = 0.0
+        with torch.no_grad():
+            for images, masks in val_loader:
+                images = images.to(device)
+                masks = masks.to(device)
+
+                outputs = model(images)
+                loss = criterion(outputs, masks)
+                epoch_val_loss += loss.item() * images.size(0)
+
+                del images, masks, outputs
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+        train_loss = epoch_train_loss / len(train_loader.dataset)
+        val_loss = epoch_val_loss / len(val_loader.dataset)
+        train_losses.append(train_loss)
+        val_losses.append(val_loss)
+
+        scheduler.step(val_loss)
+
+        if val_loss < best_loss:
+            best_loss = val_loss
+            try:
+                torch.save(model.state_dict(), model_path)
+                print(f"Model saved to {model_path}")
+            except Exception as e:
+                print(f"Failed to save model: {e}")
+                fallback_path = os.path.expanduser("~/sunspot_unet_minimal.pth")
+                try:
+                    torch.save(model.state_dict(), fallback_path)
+                    print(f"Model saved to fallback location: {fallback_path}")
+                    model_path = fallback_path
+                except Exception as e2:
+                    print(f"Failed to save to fallback location as well: {e2}")
+
+        print(f"Epoch {epoch + 1}/{epochs}")
+        print(f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
+
+    plt.figure(figsize=(8, 4))
+    plt.plot(train_losses, label='Training Loss')
+    plt.plot(val_losses, label='Validation Loss')
+    plt.legend()
+
+    plot_path = os.path.join(save_dir, 'loss_plot.png')
+    try:
+        plt.savefig(plot_path)
+        print(f"Plot saved to {plot_path}")
+    except Exception as e:
+        print(f"Failed to save plot: {e}")
+        fallback_plot = os.path.expanduser("~/loss_plot.png")
+        try:
+            plt.savefig(fallback_plot)
+            print(f"Plot saved to fallback location: {fallback_plot}")
+        except Exception as e2:
+            print(f"Failed to save plot to fallback location as well: {e2}")
+
+    plt.close()
+    return model_path
+
+# ================ Evaluation and Visualization Function ================
+def evaluate_model(model, test_loader, threshold=0.5, visualize=True, num_visualizations=3):
+    model.eval()
+    all_preds = []
+    all_targets = []
+    all_images = []
+
+    with torch.no_grad():
+        for images, masks in test_loader:
+            images = images.to(device)
+            outputs = model(images)
+            preds = torch.sigmoid(outputs)
+            preds = (preds > threshold).float()
+
+            all_images.append(images.cpu())
+            all_preds.append(preds.cpu())
+            all_targets.append(masks.cpu())
+
+    all_images = torch.cat(all_images, dim=0)
+    all_preds = torch.cat(all_preds, dim=0)
+    all_targets = torch.cat(all_targets, dim=0)
+
+    preds_flat = all_preds.numpy().flatten()
+    targets_flat = all_targets.numpy().flatten()
+
+    precision, recall, f1, _ = precision_recall_fscore_support(targets_flat, preds_flat, average='binary')
+    jaccard = jaccard_score(targets_flat, preds_flat)
+
+    metrics = {"precision": precision, "recall": recall, "f1": f1, "jaccard": jaccard}
+
+    if visualize:
+        num_samples = min(num_visualizations, all_images.shape[0])
+        indices = np.random.choice(all_images.shape[0], num_samples, replace=False)
+        for idx in indices:
+            img = all_images[idx].permute(1, 2, 0).numpy()
+            gt_mask = all_targets[idx].squeeze(0).numpy()
+            pred_mask = all_preds[idx].squeeze(0).numpy()
+
+            fig, axs = plt.subplots(1, 3, figsize=(12, 4))
+            axs[0].imshow(img)
+            axs[0].set_title("Input Image")
+            axs[0].axis("off")
+
+            axs[1].imshow(gt_mask, cmap='gray')
+            axs[1].set_title("Ground Truth")
+            axs[1].axis("off")
+
+            axs[2].imshow(pred_mask, cmap='gray')
+            axs[2].set_title("Prediction")
+            axs[2].axis("off")
+
+            plt.tight_layout()
+            plt.show()
+
+    return metrics
+
+# ================ Single Image Inference Function ================
+def infer_single_image(image_path, model, threshold=0.5, visualize=True):
+    temp_dataset = SunspotDataset(os.path.dirname(image_path))
+
+    image = temp_dataset.preprocess_image(image_path)
+    image_tensor = torch.from_numpy(image).permute(2, 0, 1).float() / 255.0
+    image_tensor = image_tensor.unsqueeze(0).to(device)
+
+    model.eval()
+    with torch.no_grad():
+        output = model(image_tensor)
+        prob = torch.sigmoid(output)
+        pred_mask = (prob > threshold).float().cpu().squeeze(0).squeeze(0).numpy()
+
+    detection_threshold = 0.15
+    sunspot_ratio = np.mean(pred_mask)
+    print("Sunspot Ratio:", sunspot_ratio)
+
+    if sunspot_ratio > detection_threshold:
+        result = "Sunspot Detected"
+    else:
+        result = "No Sunspot Detected"
+
+    if visualize:
+        fig, axs = plt.subplots(1, 3, figsize=(15, 5))
+
+        axs[0].imshow(image)
+        axs[0].set_title("Input Image")
+        axs[0].axis("off")
+
+        axs[1].imshow(pred_mask, cmap='gray', vmin=0, vmax=1)
+        axs[1].set_title("Predicted Mask")
+        axs[1].axis("off")
+
+        prob_values = prob.cpu().numpy().flatten()
+        axs[2].hist(prob_values, bins=50, color='blue', alpha=0.7)
+        axs[2].set_title("Histogram of Predicted Probabilities")
+        axs[2].set_xlabel("Probability")
+        axs[2].set_ylabel("Pixel Count")
+
+        plt.suptitle(result)
+        plt.tight_layout()
+        plt.show()
+
+    print(result)
+    return result
+
+# ================ Main Execution ================
+def main(data_dir):
+    train_dir = os.path.join(data_dir, 'train')
+    test_dir = os.path.join(data_dir, 'test')
+
+    train_dataset = SunspotDataset(train_dir)
+    test_dataset = SunspotDataset(test_dir)
+
+    train_size = int(0.8 * len(train_dataset))
+    val_size = len(train_dataset) - train_size
+    train_dataset, val_dataset = random_split(train_dataset, [train_size, val_size])
+
+    batch_size = 2
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size)
+
+    model = UNet(in_channels=3, out_channels=1, features=[64, 128]) # Increased features
+
+    model_path = train_model(model, train_loader, val_loader, epochs=30, accumulation_steps=4)
+
+    try:
+        model.load_state_dict(torch.load(model_path))
+        print(f"Model loaded from {model_path}")
+    except Exception as e:
+        print(f"Failed to load model: {e}")
+        print("Using current model state for evaluation")
+
+    metrics = evaluate_model(model, test_loader, visualize=True, num_visualizations=3)
+
+    print("\nEvaluation Metrics:")
+    for metric, value in metrics.items():
+        print(f"{metric.capitalize()}: {value:.4f}")
+
+    new_image_path = r"C:\Users\chris\Downloads\sunspot -1.jpg"
+    infer_single_image(new_image_path, model)
+
+    return model, metrics
+
+if __name__ == "__main__":
+    data_directory = r"C:/Users/chris/Downloads/sunspot classification.v1i.multiclass"
+    main(data_directory)
